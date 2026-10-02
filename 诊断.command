@@ -143,8 +143,8 @@ printf '  App 是否被强制浅色: %s\n' "$FORCED"
 if [ "$FORCED" = "1" ]; then
   echo "  ✓ 已强制浅色（这是规避 Tk 深色模式崩溃的正确设置）"
 else
-  echo "  ✗ 未强制浅色。如果系统是深色模式，Tk 8.6 会在创建窗口时崩溃。"
-  echo "    修复命令（复制到终端执行，不影响系统其它外观）："
+  echo "  ! 未强制浅色。Tk 8.6 在深色外观下取色会崩；浅色下也可能因其它原因崩，"
+  echo "    所以别只靠这一条判断。修复命令（不影响系统其它外观）："
   printf '      defaults write %s NSRequiresAquaSystemAppearance -bool YES\n' "$BID"
   echo "      killall cfprefsd"
 fi
@@ -164,9 +164,29 @@ fi
 echo "  提示：Tk 8.6.9 及更早对 macOS 深色模式支持很差；8.6.12 也只是部分修好。"
 
 # ---------------------------------------------------------------- 7. 真跑一次
-hdr "7. 直接运行主程序，抓真实报错"
-echo "  下面会直接启动 App 本体并捕获输出（最多等 15 秒）…"
+hdr "7. 两种方式各启动一次，抓真实报错"
+
+# 说明：这两种方式【不等价】。
+#   · 用 open 启动 = 双击的效果，走 LaunchServices，AppKit 完整初始化。
+#   · 直接执行 Contents/MacOS 里的二进制 = 能抓到 stderr，但 AppKit 的初始化
+#     路径和双击不同，GUI 程序有可能因此表现异常。
+# 所以先 open，死了再直接执行取日志。
+
+echo "── 7a. 用 open 启动（等同双击）──"
+pkill -f "$(basename "$BIN")" > /dev/null 2>&1 || true
+sleep 1
+open "$APP" 2>&1 | sed 's/^/  /'
+sleep 8
+if pgrep -f "Contents/MacOS/$(basename "$BIN")" > /dev/null 2>&1; then
+  echo "  ✅ 还活着 —— 双击其实是能打开的"
+  ALIVE_VIA_OPEN=1
+else
+  echo "  ❌ 启动后已退出"
+  ALIVE_VIA_OPEN=0
+fi
 echo
+
+echo "── 7b. 直接执行主程序，捕获完整 stderr ──"
 LOG="$(mktemp)"
 ( "$BIN" >"$LOG" 2>&1 ) &
 PID=$!
@@ -179,7 +199,7 @@ if kill -0 "$PID" 2>/dev/null; then
   echo "  ✓ 进程存活，界面应该已经起来了（下面把它关掉）"
   kill "$PID" 2>/dev/null
   wait "$PID" 2>/dev/null
-  echo "  → 结论：程序本身能跑，打不开纯粹是被 Gatekeeper 拦住，"
+  echo "  → 结论：程序本身能跑。如果双击打不开，那是被 Gatekeeper 拦住，"
   echo "    按第 5 节那条 xattr 命令处理后即可。"
 else
   wait "$PID" 2>/dev/null
@@ -189,26 +209,44 @@ else
   echo
 
   # ---- 关键：把 NSException 的原因单独拎出来 ----
-  REASON="$(grep -m1 -E 'Terminating app due to uncaught exception|NSException' "$LOG" 2>/dev/null)"
-  if [ -n "$REASON" ]; then
-    echo "  ══════════════════════════════════════════════════════"
-    echo "  ★ 关键线索（NSException 原因）："
-    echo "    $REASON"
-    echo "  ══════════════════════════════════════════════════════"
-    echo
+  # 这是整份报告里最重要的一行。格式是：
+  #   *** Terminating app due to uncaught exception 'NSXXX', reason: '具体原因'
+  echo "  ══════════════════════════════════════════════════════"
+  echo "  ★ 头号线索：Objective-C 异常名称与原因"
+  echo "  ══════════════════════════════════════════════════════"
+  REASON=""
+  if [ -f "$LOG" ]; then
+    REASON="$(grep -m1 'Terminating app due to uncaught exception' "$LOG" 2>/dev/null)"
   fi
+  if [ -n "$REASON" ]; then
+    printf '    %s\n' "$REASON"
+  else
+    echo "    （stderr 里没抓到完整那一行，改从崩溃报告里找）"
+    IPS="$(ls -t "$HOME/Library/Logs/DiagnosticReports"/寒山小说发布工具*.ips 2>/dev/null | head -1)"
+    if [ -n "$IPS" ]; then
+      printf '    报告: %s\n' "$IPS"
+      grep -oE '"exceptionReason"[[:space:]]*:[[:space:]]*\{[^}]*\}' "$IPS" 2>/dev/null | sed 's/^/    /'
+      grep -oE '"asi"[[:space:]]*:[[:space:]]*\{[^}]*\}' "$IPS" 2>/dev/null | sed 's/^/    /'
+      echo "    ↑ 如果上面是空的，请把整个 .ips 文件发出去："
+      printf '      %s\n' "$IPS"
+    fi
+  fi
+  echo
 
   if grep -q 'TkpGetColor' "$LOG" 2>/dev/null; then
-    echo "  ★★ 判定：这是 Tk 的 macOS 取色函数崩溃。"
-    echo "     TkpGetColor() 依赖 NSAppearance.currentAppearance，"
-    echo "     在深色外观下会失败并抛 NSException（Tk 工单 3e9e82bc）。"
-    echo "     Python 层接不住这个 Objective-C 异常，直接 SIGABRT。"
+    echo "  ★★ 判定：崩溃点在 Tk 的 macOS 取色函数 TkpGetColor()。"
+    echo "     这是 Tk 8.6 在 macOS 上的老大难（Tk 工单 3e9e82bc）：该函数依赖"
+    echo "     NSAppearance.currentAppearance，而它并不总是在绘图上下文里被调用，"
+    echo "     取色失败就抛 NSException，Python 层接不住，直接 SIGABRT。"
     echo
-    echo "     解法（任选，都不用重新打包）："
-    echo "       ① 上面第 6.5 节那条 defaults write 命令，给这个 App 单独强制浅色"
-    echo "       ② 或：系统设置 → 外观 → 选「浅色」，再打开 App"
-    echo "     根治：Info.plist 里 NSRequiresAquaSystemAppearance 必须为 True，"
-    echo "           同时 rthook 在 Tk 之前把外观钉成 Aqua —— 改完后重新打包。"
+    echo "     ⚠ 注意：即使系统是浅色模式也可能触发 —— 上面那行「异常原因」是关键，"
+    echo "       它决定了到底该改外观、还是该换 Tcl/Tk 版本。"
+    echo
+    echo "     可尝试（都不用重新打包）："
+    echo "       ① 第 6.5 节那条 defaults write，给这个 App 单独强制浅色"
+    echo "       ② 系统设置 → 外观 → 浅色"
+    echo "       ③ 若上面都没用，则是 Tcl/Tk 与当前 macOS 版本不兼容，"
+    echo "          需要换更新的 Tcl/Tk 重新打包"
     echo
   fi
 
@@ -251,9 +289,13 @@ echo "  把上面完整的终端输出复制走即可。重点看："
 echo "    · 第 3 节「架构不匹配」→ 换对应架构的包"
 echo "    · 第 4 节「系统版本不足」→ 换台新一点的 Mac"
 echo "    · 第 5 节「有隔离属性」→ 执行那条 xattr 命令"
-echo "    · 第 6.5 节「未强制浅色」→ 执行那条 defaults write 命令（Tk 崩窗口的头号原因）"
-echo "    · 第 7 节「TkpGetColor」→ 确认是 Tk 深色模式崩溃，该节里有现成的解法"
-echo "    · 第 7 节「启动即退出」→ 是打包问题，贴它的输出"
+echo "    · 第 6.5 节「未强制浅色」→ 可以顺手做掉，但别指望它一定管用"
+echo "    · 第 7a 节 → 这个才代表「双击的效果」。它活着而 7b 死，"
+echo "                 说明只是启动方式差异，不是包坏了"
+echo "    · 第 7 节「Objective-C 异常名称与原因」→ ★ 最重要的一行，一定要带上"
+echo "    · 第 7 节「TkpGetColor」→ Tk 取色崩溃，见该节的三条解法"
+echo
+echo "  最省事的做法：直接把这一整屏【截图】（Command+Shift+3）发出去。"
 echo
 read -n 1 -s -r -p "  按任意键关闭…"
 echo
