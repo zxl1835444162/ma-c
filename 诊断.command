@@ -14,6 +14,16 @@
 
 APP=""
 
+# ---------------------------------------------------------------- 顺手存档
+# 终端里的输出很容易滚掉、也容易被截断。这里同时把整份报告写到桌面上的文件里，
+# 需要求助时直接把那个文件发出去即可，不用再手动复制粘贴。
+REPORT="$HOME/Desktop/寒山小说诊断报告.txt"
+if : > "$REPORT" 2>/dev/null; then
+  exec > >(tee "$REPORT") 2>&1
+else
+  REPORT=""
+fi
+
 # A) 拖拽进来的路径
 if [ -n "$1" ]; then
   APP="$1"
@@ -296,6 +306,12 @@ echo "    · 第 7 节「Objective-C 异常名称与原因」→ ★ 最重要�
 echo "    · 第 7 节「TkpGetColor」→ Tk 取色崩溃，见该节的三条解法"
 echo
 echo "  最省事的做法：直接把这一整屏【截图】（Command+Shift+3）发出去。"
+if [ -n "$REPORT" ]; then
+  echo
+  echo "  更好的做法：本报告已自动存成文件，把它直接发出去就行 ——"
+  printf '    %s\n' "$REPORT"
+  echo "  它就是纯文本，可以直接拖进聊天窗口。"
+fi
 echo
 read -n 1 -s -r -p "  按任意键关闭…"
 echo
