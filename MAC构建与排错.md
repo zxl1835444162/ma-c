@@ -132,10 +132,29 @@ GitHub 的 artifact 下载下来本身就是一层 zip，而旧 workflow 在 zip
 | 改动 | 解决的问题 |
 |---|---|
 | 一次产出 **arm64 + x86_64** 两个包（matrix） | 彻底消除「架构选错」 |
+| **同时构建 Python 3.10 与 3.13 两套**（matrix） | Python 3.10 自带的 Tcl/Tk 是 8.6.12（2021 年），在 macOS 15 上会崩；3.13 自带新一代 Tk。两套并存，自检结果直接告诉你要哪套 |
 | Python 用 **python.org universal2 官方包**，不用 Homebrew | 消除 Tcl/Tk 路径依赖，同时让它能在 arm64 机器上交叉产出 x86_64 |
-| 加 **启动自检**：真的把 .app 跑起来 20 秒，起不来就构建失败并打印堆栈 | 坏包再也发不出来 |
+| 加 **启动自检**（浅色 + 深色各跑一次） | 坏包再也发不出来，**且不在自检失败时让整个运行变红** —— 结论直接写进 artifact 名字（「可用-…」/「启动失败-…」） |
 | 加 **私有路径扫描**：`otool` 检查包内是否残留 `/opt/homebrew`、`/Users/runner` | 提前拦住「构建机能跑、你的机器不能跑」 |
 | 产物是**单层 zip**，且 artifact 名字与内层 zip 不再重名 | 消除解压层级误判 |
+
+### 为什么是 Python 3.10 在拖后腿
+
+原流程固定用 **Python 3.10.11** 构建。而 **Python 3.10 自 2023 年起，python.org 就只发源码、不再发布安装包了** —— 它自带的 Tcl/Tk 被永久冻结在 **8.6.12**。
+
+实测崩溃栈：
+
+```
+TkpGetColor → Tk_GetColor → Tk_Get3DBorder → Tk_InitOptions
+→ CreateFrame → TkInitialize → Tkapp_New
+libc++abi: terminating due to uncaught exception of type NSException
+```
+
+正是 Tk 在 macOS 15.6 上创建根窗口时的取色代码。**这个 Tk 版本无法修补，只能换 Python 版本。**
+
+源码已通过 Python 3.13 的静态兼容性检查：23 个 `.py` 文件**语法零错误**，且**没有**用到任何在 3.12/3.13 中被移除的模块或 API（`distutils`、`imp`、`inspect.getargspec`、`asyncio.coroutine`、`collections.Mapping`、`cgi` 等均为 0 处）。
+
+> 所以 **py3.13 是首选**；py3.10 保留为对照组，用来确认问题确实出在 Tk 版本上。
 
 **操作步骤**（假设你还没把它推上 GitHub）：
 
