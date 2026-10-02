@@ -31,3 +31,7 @@ config.ini
 auth.json
 签约信息.txt
 Shortcuts/
+
+# 分发包（用 _build_zip.py 生成本地传输用的 zip；CI 会产出正式安装包）
+Mac修复工具包.zip
+*.zip
