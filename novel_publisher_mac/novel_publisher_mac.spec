@@ -91,6 +91,11 @@ excludes = [
     # 体积杀手
     'matplotlib', 'numpy', 'pandas', 'scipy', 'PyQt5', 'PyQt6', 'PySide2', 'PySide6',
     'IPython', 'jupyter', 'notebook', 'pytest', 'sphinx', 'tkinter.test', 'test',
+    # Pillow 的可选编解码扩展。应用完全用不到它们，但它们的 macOS 轮子未必是
+    # universal2 —— 实测 PIL/_avif.cpython-313-darwin.so 只有 arm64 切片，
+    # 在 arm64 机器上交叉产出 x86_64 时会让 PyInstaller 抛
+    # IncompatibleBinaryArchError 直接中断构建。
+    'PIL._avif', 'PIL._webp', 'PIL._imagingcms', 'PIL._imagingmath', 'PIL._raqm',
 ]
 
 if IS_DARWIN:

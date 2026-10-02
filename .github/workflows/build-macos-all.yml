@@ -3,26 +3,37 @@ name: 构建 macOS 应用（多 Python/Tk 版本 + 启动自检）
 # =============================================================================
 #  为什么会有这个版本的工作流
 # =============================================================================
-#  实测结论：原流程固定用 Python 3.10.11 构建，而它自带的是 **Tcl/Tk 8.6.12**
-#  （2021 年的代码）。这个 Tk 在 macOS 15.6 上创建根窗口时会崩：
+#  【已定位的真正根因】不是 Tk 版本，是启动钩子把 NSApp 顶掉了。
 #
-#      TkpGetColor → Tk_GetColor → Tk_Get3DBorder → Tk_InitOptions
-#      → CreateFrame → Initialize → Tkapp_New
-#      libc++abi: terminating due to uncaught exception of type NSException
+#  实测崩溃（macOS 15.6）：
+#      NSInvalidArgumentException,
+#      reason: '-[NSApplication macOSVersion]: unrecognized selector sent to instance'
+#        TkSetMacColor → Tk_GetColor → Tk_Get3DBorder → Tk_InitOptions
+#        → TkCreateFrame → Tk_Init → Tkinter_TkInit → Tkapp_New
+#        libc++abi: terminating due to uncaught exception of type NSException
 #
-#  而且 Python 3.10 自 2023 年起 python.org 就只发源码、不再更新安装包了 ——
-#  它自带的 Tk 版本被永久冻结，无法修补。所以唯一可靠的办法是：
-#  **换更晚的 Python 版本构建，自带更新一代的 Tcl/Tk。**
+#  Tk 的 macOS 实现把 `macOSVersion` 等方法加在自己的 NSApplication 子类
+#  `TKApplication` 上，并期望 `NSApp` 就是 `TKApplication`。
+#  而 `novel_publisher_mac/rthook_frozen_macos.py` 以前在 **Tk 之前**调用了
+#  `NSApplication.sharedApplication()`，AppKit 于是抢先创建了一个普通
+#  NSApplication 并把它设为全局单例，Tk 之后换不回来 —— 一取色就崩。
 #
-#  本工作流一次同时产出多套组合，并在真机上逐个启动验证：
+#  这解释了全部现象：浅色深色都崩、换 Tcl/Tk 版本也没用、
+#  原作者本机「测试通过」（旧版 macOS 的 Tk 还没开始调 macOSVersion）。
 #
-#      py3.10 (= 现状，Tk 8.6.12)  ← 对照组，用来确认问题确实出在 Tk 版本
-#      py3.13 (= 新 Tk)            ← 首选，源码已通过 3.13 静态兼容性检查
+#  修复：钩子里彻底不再碰 AppKit；前台激活挪到 Tk 建好之后
+#  （`macos_support.apply_darwin_tk_defaults`，那里本来就是正确时机）。
 #
-#  每套 × 两个架构。启动自检通过的那套，artifact 名字会带「可用」前缀。
+#  ---------------------------------------------------------------------------
+#  顺带保留的价值
+#  · 仍然用 py3.13 而不是 3.10 —— 3.10 的 macOS 安装包 python.org 早已停发，
+#    自带的 Tcl/Tk 被永久冻结，是条死路。
+#  · 仍然构建两个架构，并且**真的把 .app 跑起来验证**（浅色 + 深色各一次），
+#    结论写进 artifact 名字：`可用-自检通过-…` / `启动失败-勿下载-…`。
+#    ——正是这道自检在上一轮把上面那个崩溃栈原样打了出来。
 #
-#  用法：Actions 页 → 左侧选本工作流 → Run workflow（不用填参数）
-#        → 等 20-40 分钟 → 优先下载名字里带「可用」的、且架构匹配你 Mac 的那个
+#  用法：Actions 页 → Run workflow（不用填参数）
+#        → 等 15-30 分钟 → 下载名字带「可用」且架构匹配你 Mac 的那个
 # =============================================================================
 
 on:
@@ -43,12 +54,16 @@ jobs:
     name: py${{ matrix.pyver }} · ${{ matrix.arch }}
     runs-on: macos-14          # Apple Silicon(M1) 真机，同时交叉产出 x86_64
     timeout-minutes: 60
+    # x86_64 是在 arm64 runner 上交叉瘦身产出的，个别第三方轮的切片问题可能让它失败。
+    # 标记为「允许失败」，不把整个运行拖红 —— 你的 Mac 若是 Apple Silicon 根本用不上它。
+    continue-on-error: ${{ matrix.arch == 'x86_64' }}
     strategy:
       fail-fast: false
       matrix:
         arch: [arm64, x86_64]
-        # 想只构建其中一个版本，把不想要的那个从这一行删掉即可。
-        pyver: ['3.10', '3.13']
+        # 只构建 3.13：Python 3.10 的 macOS 安装包 python.org 早已停发，
+        # 它自带的 Tcl/Tk 被永久冻结在旧版本，是条死路（留作对照组只会制造噪音）。
+        pyver: ['3.13']
     defaults:
       run:
         working-directory: novel_publisher_mac
@@ -273,11 +288,13 @@ jobs:
             set -e
             echo "  ✗ 启动即退出" | tee -a "$SUMMARY"
             FAILED="$label"
+            # 同时打到 CI 日志和结果文件里 —— 只写文件的话，出问题时在
+            # Actions 页面上什么都看不到，还得先下载 60MB 的产物才知道原因。
             {
               echo "---------------- $label 启动输出 ----------------"
               cat "$log" || true
               echo "-------------------------------------------------"
-            } >> "$SUMMARY"
+            } 2>&1 | tee -a "$SUMMARY"
             if grep -q 'TkpGetColor' "$log" 2> /dev/null; then
               echo "命中 Tk 取色崩溃（TkpGetColor → NSException）" | tee -a "$SUMMARY"
             fi

@@ -265,23 +265,37 @@ def site_url_for(writer_name: str = '', site: str = 'https://xingyuexiezuo.com')
 def apply_darwin_tk_defaults(root) -> None:
     """macOS 上 tkinter 的几处平台差异修正。
 
-    * 原程序用「微软雅黑」，macOS 无此字体，回退到系统默认中文字体；
-    * Tk 8.6 之前的旧版会让窗口贴顶，这里统一抬高一点；
-    * macOS 需要显式设置前台进程属性，否则窗口可能被终端挡住。
+    ⚠ 这个函数必须在【Tk 根窗口已经创建之后】才调用（现在是在
+      `NovelPublisherApp()` 实例化之后）—— 因为它会碰 AppKit。
+      千万不能在 Tk 之前调，否则 AppKit 会抢先创建普通 NSApplication，
+      把 Tk 期望的 TKApplication 顶掉，启动时崩在
+      `-[NSApplication macOSVersion]: unrecognized selector`。
+
+    做三件事：
+    * 把 Tcl/Tk 缩放调到与 Retina 匹配；
+    * 把进程声明为前台应用，否则从访达/终端启动时窗口可能被别的应用挡住，
+      用户会以为「双击没反应」；
+    * 打印一下 NSApp 的实际类名，方便确认 Tk 用的是它自己的 TKApplication。
     """
     if not IS_MAC:
         return
+
     try:
         root.tk.call('tk', 'scaling', 1.4)
     except Exception:
         pass
-    for seq, func in ():
-        pass
+
     try:
         from AppKit import NSApplication, NSApplicationActivationPolicyRegular
-        NSApplication.sharedApplication().setActivationPolicy_(NSApplicationActivationPolicyRegular)
-    except Exception:
-        pass
+        app = NSApplication.sharedApplication()
+        print(f'[macos] NSApp 实际类名: {app.__class__.__name__}')
+        if app.__class__.__name__ != 'TKApplication':
+            print('[macos] ⚠ 预期是 TKApplication；不是的话，创建窗口时可能崩在 '
+                  '「-[NSApplication macOSVersion]: unrecognized selector」。')
+        app.setActivationPolicy_(NSApplicationActivationPolicyRegular)
+        app.activateIgnoringOtherApps_(True)
+    except Exception as exc:
+        print(f'[macos] 前台激活设置失败（不影响主功能）: {exc}')
 
 def preferred_ui_font(size: int = 9) -> tuple:
     """日志区等控件用的字体。"""
