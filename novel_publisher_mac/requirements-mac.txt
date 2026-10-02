@@ -1,0 +1,38 @@
+# =============================================================================
+#  寒山小说发布工具 · macOS 运行/打包依赖（Python 3.10）
+#  目标平台：macOS 11+（arm64 / x86_64）
+#
+#  安装：
+#      python3.10 -m pip install -r requirements-mac.txt
+#      python3.10 -m playwright install chromium   # 可选：让内置 chromium 可用
+#
+#  注：tkinter 是标准库但不随 Homebrew 的 python 自动安装，
+#      官网版 Python 3.10 自带；Homebrew 需额外 `brew install python-tk@3.10`。
+# =============================================================================
+
+# --- 浏览器自动化核心 ---------------------------------------------------------
+# 本工程在 1.63.0 上完成全部实测（Windows 实机发布链路验证通过）
+playwright==1.63.0
+greenlet>=3.0.0
+pyee>=11.0.0
+
+# --- 网页解析与请求 -----------------------------------------------------------
+requests>=2.31.0
+urllib3>=2.0.0
+certifi>=2024.2.2
+charset-normalizer>=3.3.0
+idna>=3.6
+parsel>=1.9.0
+lxml>=5.0.0
+cssselect>=1.2.0
+jmespath>=1.0.1
+
+# --- GUI / 托盘 / 图像 --------------------------------------------------------
+pillow>=10.0.0
+pystray>=0.19.5
+# pystray 在 macOS 上走 NSStatusBar 后端，必须有 pyobjc
+pyobjc-framework-Cocoa>=10.0
+pyobjc-framework-Quartz>=10.0
+
+# --- 打包（仅构建期需要，运行 .app 时不需要）----------------------------------
+pyinstaller>=6.6.0

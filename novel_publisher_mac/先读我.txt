@@ -1,0 +1,129 @@
+寒山小说发布工具 · macOS 版本
+================================
+
+从 Windows 版 app(1).exe 逆向还原并移植到 macOS。
+
+
+══════════════════════════════════════════════════════════════
+  先回答你最可能想问的：能在 Windows 上直接打出 Mac 直装包吗？
+══════════════════════════════════════════════════════════════
+
+分两种「直装包」，答案不一样：
+
+【A】完全自包含的 .app（内置 Python 运行时，拷到任何 Mac 双击就开）
+      × 用 PyInstaller 在 Windows 上做不到。原因不是配置问题：
+        · PyInstaller 的引导器是每平台单独编译的 Mach-O 二进制；
+        · 需要目标平台的 libpython3.10.dylib 和一堆 .so 扩展模块；
+        · Apple Silicon 上所有二进制必须至少有 ad-hoc 签名，而 codesign
+          是 macOS 专有工具。
+        我实测过：macOS 版的 PyInstaller 轮子（含 macOS 引导器）确实能从
+        Windows 下载到，但把整套 macOS 运行时拼装出来并不可靠，而且我
+        无法在 Windows 上验证产物能不能启动 —— 交付一个我没验证过的包
+        比不交付更糟。
+      √ 可行办法：GitHub Actions（见下方「路线 2」）。用免费的 macOS
+        真机构建，全程你都在 Windows 上操作。
+
+【B】双击就能跑的 .app（首次启动时在 Mac 上自动准备 Python 环境）
+      √ 已经给你打好了，就是这个 zip 里的「寒山小说发布工具.app」。
+        它不依赖 PyInstaller，因为 macOS 允许 .app 里的可执行文件是
+        带 shebang 的脚本，不需要编译也不需要签名 —— 所以这一步能在
+        Windows 上完成。
+        代价：首次启动需要联网，并且机器上要有 Python 3.10。
+
+
+══════════════════════════════════════════════════════════════
+  三条路线，按你的情况选
+══════════════════════════════════════════════════════════════
+
+路线 0（最快）| 直接用本 zip 里的 .app
+----------------------------------------------------------------
+把「寒山小说发布工具.app」拷到 Mac，双击。
+
+首次启动会：
+  1. 找带 tkinter 的 Python 3.10；找不到就弹原生对话框给你下载链接
+  2. 在 ~/Library/Application Support/寒山小说发布工具/venv 建环境装依赖
+  3. 启动应用
+
+首次约 1-3 分钟（需要联网），之后秒开。
+
+被 macOS 拦截时（因为没签名）：右键 → 打开 → 再点「打开」。
+
+**前置条件**：Mac 上要有带 tkinter 的 Python 3.10
+  · 官网安装包（自带 tkinter，推荐）
+    https://www.python.org/downloads/release/python-31011/
+    选 "macOS 64-bit universal2 installer"
+  · 或 Homebrew：brew install python@3.10 python-tk@3.10
+
+
+路线 1 | 有 Mac，想要完全自包含的 .app
+----------------------------------------------------------------
+1. 把 novel_publisher_mac 文件夹拷到 Mac
+2. 终端里粘三行：
+
+   cd ~/Downloads/novel_publisher_mac
+   chmod +x *.sh *.command assets/*.sh
+   ./build_mac.sh
+
+3. 等 5-10 分钟，产物在 dist/寒山小说发布工具.app（内置 Python，双击就开）
+
+想顺便出 dmg 安装镜像：MAKE_DMG=1 ./build_mac.sh
+
+
+路线 2 | 没有 Mac，但想要完全自包含的 .app  ★推荐
+----------------------------------------------------------------
+用 GitHub Actions 的免费 macOS 真机来构建，你全程在 Windows 上。
+
+1. 在 GitHub 建一个公开仓库
+2. 把 github仓库模板/ 里的 .github 文件夹，和 novel_publisher_mac 文件夹，
+   一起上传到仓库根目录（结构见 github仓库模板/说明.md）
+3. 仓库 Actions 页 →「构建 macOS 应用」→ Run workflow → 选 arm64
+4. 等 5-10 分钟，在 Artifacts 区下载 zip
+5. 解压得到 .app，拷到 Mac 双击
+
+公开仓库的 macOS runner 免费无限量。详细步骤见
+github仓库模板/说明.md
+
+
+══════════════════════════════════════════════════════════════
+  文件说明
+══════════════════════════════════════════════════════════════
+
+app.py                   主程序（5715 行，135 个函数/方法）
+novel_publisher/         13 个业务模块
+macos_support.py         macOS 平台适配层（.command 分身/打开文件/进程/托盘）
+platform_patch.py        启动时把 Windows 专有实现换成跨平台版本
+browser_detector.py      Chrome/Edge/Chromium 探测（含 macOS 路径）
+icon.py                  base64 内嵌图标
+novel_publisher_mac.spec PyInstaller 配置（macOS / Windows 通用）
+rthook_frozen_macos.py   macOS 运行时钩子（修 node 可执行位 + 窗口前台化）
+build_mac.sh             一键打包（8 步流水线，已实测跑通构建流程）
+make_dmg.sh              出 .dmg
+启动.command             免打包启动器（在 Mac 上双击即跑源码）
+github仓库模板/          路线 2 用的 GitHub Actions 工作流
+assets/app.icns          应用图标（已在 Windows 上用 Python 生成好）
+assets/make_icns.sh      macOS 原生重做图标（效果更好，可选）
+README_MAC_BUILD.md      完整打包与排错文档 ← 遇到问题先看这个
+selftest_business.py     业务自检（打包前会跑，不过就不打包）
+
+数据目录（配置、登录态、浏览器分身）：
+  ~/Library/Application Support/寒山小说发布工具/
+
+
+══════════════════════════════════════════════════════════════
+  已经验证过 / 还没验证过
+══════════════════════════════════════════════════════════════
+
+已验证：
+  · PyInstaller 打包流水线在 Windows 上完整跑通（Analysis→EXE→COLLECT），
+    产物启动正常、界面完整、配置正确加载
+  · 本 zip 里 .app 的目录结构、Info.plist、图标、权限位
+  · 启动脚本通过 bash -n 语法检查
+  · .icns 结构合法（8 个 PNG 块）
+  · 业务自检全部通过
+
+未验证（我这里没有 Mac，无法测）：
+  · macOS 上 codesign / hdiutil / sips 的实际行为
+  · .app 在 Finder 里双击的真实表现
+  · PyInstaller 产出的 .app 在 macOS 上能否正常启动
+
+如果在 Mac 上跑出问题，把终端输出整段贴出来即可。

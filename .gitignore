@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.venv/
+.venv-build/
+.venv-run/
+venv/
+
+# PyInstaller
+build/
+dist/
+dist_mac/
+*.manifest
+
+# macOS
+.DS_Store
+._*
+.AppleDouble
+.LSOverride
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+
+# 运行时产物
+*.log
+config.ini
+auth.json
+签约信息.txt
+Shortcuts/

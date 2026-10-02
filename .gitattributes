@@ -1,0 +1,18 @@
+# 换行符保护。
+# 这几个文件在 Windows 上被 git 换成 CRLF 后，拿到 macOS 上会直接
+# 报 “bad interpreter: /bin/bash^M”，双击毫无反应 —— 属于必须拦住的坑。
+* text=auto eol=lf
+
+*.command text eol=lf
+*.sh      text eol=lf
+
+*.yml     text eol=lf
+*.yaml    text eol=lf
+*.py      text eol=lf
+
+# 二进制不要动
+*.icns    binary
+*.png     binary
+*.jpg     binary
+*.zip     binary
+*.dmg     binary

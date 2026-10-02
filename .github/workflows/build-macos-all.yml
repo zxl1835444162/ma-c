@@ -1,0 +1,387 @@
+name: 构建 macOS 应用（双架构 + 启动自检）
+
+# =============================================================================
+#  用 GitHub 免费的 macOS 真机把本工程打包成自包含的 .app。
+#
+#  用法：仓库 Actions 页 → 左侧选「构建 macOS 应用（双架构 + 启动自检）」
+#        → Run workflow（不用选参数）→ 等 15-25 分钟 → 在 Artifacts 里
+#        按自己机器的架构下载。
+#
+#  ---------------------------------------------------------------------------
+#  和原来那份 workflow 的差别，逐条都是为了解决「下载回去打不开」：
+#
+#  1) 一次同时产出 arm64 和 x86_64 两个包。
+#     原版要手选架构，选错（比如 Apple Silicon 机器下了 x86_64，或反过来）
+#     就是典型的「双击打不开 / 需要 Rosetta」。
+#
+#  2) Python 改用 python.org 官方 universal2 安装包，不再用 Homebrew。
+#     原版在 setup-python 不带 tkinter 时会回退到 brew install python-tk@3.10。
+#     Homebrew 的 Tcl/Tk 是绝对路径依赖（/opt/homebrew/opt/tcl-tk/...），
+#     PyInstaller 未必能把它们正确搬进 .app，结果就是：包在构建机上是好的，
+#     拿到没装 Homebrew 的 Mac 上启动即闪退 —— 表现正是「打不开」。
+#     官方 universal2 包是 PyInstaller 官方文档推荐的 macOS 打包基座，
+#     而且同时含 x86_64 + arm64 两个切片，才能在 arm64 机器上交叉产出
+#     x86_64 的包（PyInstaller 不支持交叉编译，但支持用 universal2
+#     解释器做 target_arch 瘦身）。
+#
+#  3) 打包完强制执行「启动自检」：真的把 .app 跑起来 20 秒。
+#     起不来 → 直接判构建失败并在日志里打出完整的启动堆栈。
+#     坏包从此流不出去，你也不用靠猜。
+#
+#  4) 上传前扫描包内所有二进制的动态库依赖，出现 /opt/homebrew 或
+#     /usr/local/opt 这类构建机私有绝对路径就报错。
+#
+#  5) 产物命名不再和 artifact 重名 —— 原版内层 zip 也叫
+#     「寒山小说发布工具-macOS-arm64.zip」，外层 artifact 还叫这个名字，
+#     下载解压一次得到的是另一个同名 zip，非常容易误认为「下下来不是 app」。
+# =============================================================================
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    paths:
+      - 'novel_publisher_mac/**'
+      - '.github/workflows/build-macos-all.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: 打包 ${{ matrix.arch }}
+    # macos-14 = Apple Silicon(M1) 真机。用它同时产出 arm64 与 x86_64。
+    runs-on: macos-14
+    timeout-minutes: 60
+
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [arm64, x86_64]
+
+    defaults:
+      run:
+        working-directory: novel_publisher_mac
+
+    env:
+      TARGET_ARCH: ${{ matrix.arch }}
+      PY_URL: https://www.python.org/ftp/python/3.10.11/python-3.10.11-macos11.pkg
+      PY_ROOT: /Library/Frameworks/Python.framework/Versions/3.10
+
+    steps:
+      - name: 取出源码
+        uses: actions/checkout@v4
+
+      # ---------------------------------------------------------------------
+      - name: 安装官方 universal2 Python 3.10（自带 tkinter）
+        run: |
+          set -eux
+          echo "runner: $(uname -m) / macOS $(sw_vers -productVersion)"
+
+          PKG="$RUNNER_TEMP/py310.pkg"
+          curl -fsSL --retry 3 --retry-delay 5 -o "$PKG" "$PY_URL"
+          sudo installer -pkg "$PKG" -target / > /dev/null
+
+          PY="$PY_ROOT/bin/python3.10"
+          test -x "$PY"
+          "$PY" -V
+          echo "解释器架构: $(lipo -archs "$PY")"
+          "$PY" -c 'import tkinter; print("tkinter OK, Tk", tkinter.TkVersion)'
+
+          # 解释器必须同时含目标架构的切片
+          if ! lipo -archs "$PY" | tr ' ' '\n' | grep -qx "$TARGET_ARCH"; then
+            echo "::error::$PY 不含 $TARGET_ARCH 切片，无法产出该架构的包"
+            exit 1
+          fi
+
+          echo "PY=$PY" >> "$GITHUB_ENV"
+
+      # ---------------------------------------------------------------------
+      - name: 建 venv 并安装依赖
+        run: |
+          set -eux
+          VENV="$RUNNER_TEMP/venv-$TARGET_ARCH"
+          "$PY" -m venv "$VENV"
+          "$VENV/bin/python" -m pip install --quiet --upgrade pip
+          "$VENV/bin/python" -m pip install --quiet -r requirements-mac.txt
+
+          # 逐项 import，任何一项缺失就在这里失败，而不是留到用户双击时闪退
+          "$VENV/bin/python" - <<'PYCODE'
+          import tkinter, playwright.sync_api, pystray, PIL, requests
+          import lxml, parsel, AppKit, Foundation
+          print('运行期依赖全部可导入（含 tkinter / playwright / pyobjc 托盘后端）')
+          PYCODE
+
+          "$VENV/bin/python" -m PyInstaller --version
+          echo "VPY=$VENV/bin/python" >> "$GITHUB_ENV"
+
+      # ---------------------------------------------------------------------
+      - name: 生成应用图标
+        run: |
+          set -eux
+          if [ ! -f assets/app.icns ]; then
+            bash assets/make_icns.sh
+          fi
+          ls -l assets/app.icns
+
+      # ---------------------------------------------------------------------
+      - name: 业务自检（不过就不打包）
+        run: |
+          set -eux
+          "$VPY" selftest_business.py
+
+      # ---------------------------------------------------------------------
+      - name: PyInstaller 打包
+        run: |
+          set -eux
+          rm -rf build dist
+          "$VPY" -m PyInstaller --noconfirm --clean --log-level=WARN novel_publisher_mac.spec
+
+          APP="dist/寒山小说发布工具.app"
+          test -d "$APP"
+          BIN="$APP/Contents/MacOS/寒山小说发布工具"
+          test -f "$BIN"
+          echo "主程序架构: $(lipo -archs "$BIN")"
+          du -sh "$APP"
+
+      # ---------------------------------------------------------------------
+      - name: 修权限 + 签名
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          # 刻意不开 set -x：本步会碰证书内容
+          set -eu
+          APP="dist/寒山小说发布工具.app"
+
+          # 1) 先补 node 的可执行位 —— 必须在签名之前，
+          #    签名之后再改包内任何文件都会让签名失效。
+          NODE="$(find "$APP" -type f -name node -path '*playwright/driver*' | head -1 || true)"
+          if [ -n "$NODE" ]; then
+            chmod +x "$NODE"
+            echo "已恢复 node 可执行位: $NODE ($(du -h "$NODE" | cut -f1))"
+          else
+            echo "::warning::包内未找到 playwright/driver/node，首次运行需要联网"
+          fi
+
+          # 2) 安全扫描：包内不能残留构建机私有的绝对路径依赖
+          echo "== 扫描构建机私有路径依赖 =="
+          BAD=0
+          while IFS= read -r f; do
+            case "$f" in
+              *.so|*.dylib|*/MacOS/*)
+                if otool -L "$f" 2>/dev/null | grep -qE '(/opt/homebrew|/usr/local/opt|/Users/runner)'; then
+                  echo "::error file=$f::残留构建机路径依赖："
+                  otool -L "$f" | grep -E '(/opt/homebrew|/usr/local/opt|/Users/runner)' || true
+                  BAD=1
+                fi
+                ;;
+            esac
+          done < <(find "$APP/Contents/Frameworks" "$APP/Contents/MacOS" -type f 2>/dev/null | head -400)
+          if [ "$BAD" = "1" ]; then
+            echo "::error::包内存在构建机私有路径，拿到别的 Mac 上必然启动失败。"
+            exit 1
+          fi
+          echo "未发现私有路径依赖"
+
+          # 3) 签名
+          if [ -n "${MACOS_CERT_P12:-}" ] && [ -n "${MACOS_CERT_PASSWORD:-}" ]; then
+            echo "检测到开发者证书，使用 Developer ID 正式签名"
+            KEYCHAIN="$RUNNER_TEMP/build.keychain-db"
+            KEYCHAIN_PASS="$(openssl rand -hex 32)"
+            CERT_B64="$RUNNER_TEMP/cert.b64"
+            CERT_P12="$RUNNER_TEMP/cert.p12"
+
+            printf '%s' "$MACOS_CERT_P12" > "$CERT_B64"
+            openssl base64 -d -A -in "$CERT_B64" -out "$CERT_P12"
+
+            security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
+            security set-keychain-settings -lut 21600 "$KEYCHAIN"
+            security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
+            security import "$CERT_P12" -k "$KEYCHAIN" \
+              -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+            security set-key-partition-list -S apple-tool:,apple: \
+              -k "$KEYCHAIN_PASS" "$KEYCHAIN" > /dev/null
+            security list-keychains -d user -s "$KEYCHAIN" \
+              $(security list-keychains -d user | tr -d '"')
+
+            IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN" \
+              | grep 'Developer ID Application' | head -1 \
+              | sed 's/.*"\(.*\)"/\1/')"
+            test -n "$IDENTITY" || { echo "::error::keychain 里没有 Developer ID Application 证书"; exit 1; }
+            echo "签名身份: $IDENTITY"
+
+            codesign --force --deep --options runtime --timestamp --sign "$IDENTITY" "$APP"
+            rm -f "$CERT_B64" "$CERT_P12"
+          else
+            echo "未配置开发者证书，使用 ad-hoc 签名（本机可运行，首次打开会被 Gatekeeper 拦一次）"
+            codesign --force --deep --sign - "$APP"
+          fi
+
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          codesign -dv "$APP" 2>&1 | head -5 || true
+
+      # ---------------------------------------------------------------------
+      - name: 启动自检（关键：坏包在这里就被拦下）
+        run: |
+          set -eu
+          APP="dist/寒山小说发布工具.app"
+          BIN="$APP/Contents/MacOS/寒山小说发布工具"
+          LOG="$RUNNER_TEMP/launch-$TARGET_ARCH.log"
+
+          # 干净起点，避免上次运行的 config.ini 干扰
+          rm -rf "$HOME/Library/Application Support/寒山小说发布工具" || true
+
+          PREFIX=""
+          if [ "$TARGET_ARCH" != "$(uname -m)" ]; then
+            if arch -x86_64 /usr/bin/true > /dev/null 2>&1; then
+              PREFIX="arch -x86_64"
+              echo "runner 是 $(uname -m)，用 Rosetta 跑 $TARGET_ARCH 产物做自检"
+            else
+              echo "::warning::runner 无 Rosetta，跳过 $TARGET_ARCH 的启动自检（架构已由 lipo 确认）"
+              lipo -archs "$BIN"
+              exit 0
+            fi
+          fi
+
+          echo "启动 $BIN ..."
+          set +e
+          $PREFIX "$BIN" > "$LOG" 2>&1 &
+          PID=$!
+          for _ in $(seq 1 20); do
+            sleep 1
+            kill -0 "$PID" 2> /dev/null || break
+          done
+
+          if kill -0 "$PID" 2> /dev/null; then
+            echo "✓ 启动后存活 20 秒，界面进程正常"
+            kill "$PID" 2> /dev/null
+            wait "$PID" 2> /dev/null
+            STATUS=0
+          else
+            wait "$PID" 2> /dev/null
+            STATUS=$?
+            set -e
+            echo "::error::打包后的 App 启动即退出（exit=$STATUS）——这个包不能用。"
+            echo "──────────── 启动输出 ────────────"
+            cat "$LOG" || true
+            echo "──────────────────────────────────"
+            echo "如果是 ModuleNotFoundError: tkinter / _tkinter，说明 Tcl/Tk 没打进包；"
+            echo "如果是 PermissionError: .../playwright/driver/node，说明 rthook 没生效。"
+            exit 1
+          fi
+          set -e
+
+          echo "──────────── 启动输出（前 40 行）────────────"
+          head -40 "$LOG" || true
+
+      # ---------------------------------------------------------------------
+      - name: 公证（配了 Apple 凭据且已正式签名时才执行）
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+        run: |
+          set -eu
+          if [ -z "${APPLE_ID:-}" ] || [ -z "${APPLE_TEAM_ID:-}" ] || [ -z "${APPLE_APP_PASSWORD:-}" ]; then
+            echo "未配置 Apple 凭据，跳过公证（首次打开需手动放行一次）"
+            exit 0
+          fi
+          if [ -z "${MACOS_CERT_P12:-}" ]; then
+            echo "::warning::有 Apple 凭据但没有签名证书，公证需要两者，跳过"
+            exit 0
+          fi
+
+          APP="dist/寒山小说发布工具.app"
+          ZIP_FOR_NOTARY="$RUNNER_TEMP/notarize.zip"
+          ditto -c -k --sequesterRsrc --keepParent "$APP" "$ZIP_FOR_NOTARY"
+
+          xcrun notarytool submit "$ZIP_FOR_NOTARY" \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_PASSWORD" \
+            --wait
+
+          xcrun stapler staple "$APP"
+          xcrun stapler validate "$APP"
+          rm -f "$ZIP_FOR_NOTARY"
+
+      # ---------------------------------------------------------------------
+      - name: 组装安装包（App + 说明 + 诊断脚本，单层 zip）
+        run: |
+          set -eux
+          APP="dist/寒山小说发布工具.app"
+          STAGE="dist/寒山小说发布工具-macOS-${TARGET_ARCH}"
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE"
+
+          # 必须用 ditto：普通 zip 会破坏 .app 内的符号链接与权限位，
+          # 解压出来的 .app 会直接打不开。
+          ditto "$APP" "$STAGE/寒山小说发布工具.app"
+
+          if [ -f ../一键修复.command ]; then
+            cp ../一键修复.command "$STAGE/① 双击我-修复并打开.command"
+            chmod +x "$STAGE/① 双击我-修复并打开.command"
+          fi
+          if [ -f ../诊断.command ]; then
+            cp ../诊断.command "$STAGE/② 打不开就双击我-诊断.command"
+            chmod +x "$STAGE/② 打不开就双击我-诊断.command"
+          else
+            echo "::warning::没找到仓库根目录的 诊断.command，安装包里将不含诊断脚本"
+          fi
+          cp ../MAC小白操作手册.md "$STAGE/③ 使用前必读-小白操作手册.md" 2>/dev/null || true
+          cp ../MAC构建与排错.md "$STAGE/④ 进阶-构建与排错说明.md" 2>/dev/null || true
+
+          cat > "$STAGE/先看我.txt" <<'TXTEOF'
+          寒山小说发布工具 · macOS 版
+          ==============================
+
+          这个文件夹里有 3 个文件要先弄明白：
+
+            ① 双击我-修复并打开.command
+               先双击这个。它会自动清掉 macOS 的拦截标记并把应用打开。
+               第一次双击可能被拦：右键点它 → 打开 → 弹框里再点「打开」。
+
+            ② 打不开就双击我-诊断.command
+               ① 没成功就双击这个。它会把真正的原因打印出来，
+               把那整屏文字截图发出去，别人一看就知道问题在哪。
+
+            ③ 使用前必读-小白操作手册.md
+               不会用 Mac 就看这个，图文步骤。
+
+          寒山小说发布工具.app
+               这才是应用本体。也可以直接双击它试试，
+               被拦的话先执行 ① 再双击。
+          TXTEOF
+
+          # 单层 zip：解压一次就能看到文件夹，不会再套一层同名 zip
+          rm -f "dist/寒山小说发布工具-macOS-${TARGET_ARCH}.zip"
+          ditto -c -k --sequesterRsrc --keepParent \
+            "$STAGE" "dist/寒山小说发布工具-macOS-${TARGET_ARCH}.zip"
+
+          rm -rf "$STAGE"
+          ls -lh dist/
+
+      # ---------------------------------------------------------------------
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: 寒山小说发布工具-macOS-${{ matrix.arch }}-安装包
+          path: novel_publisher_mac/dist/寒山小说发布工具-macOS-${{ matrix.arch }}.zip
+          if-no-files-found: error
+          retention-days: 30
+
+      # ---------------------------------------------------------------------
+      - name: 失败时打印诊断
+        if: failure()
+        run: |
+          echo "::group::spec 警告"
+          find . -name 'warn-*.txt' -maxdepth 2 -exec cat {} \; || true
+          echo "::endgroup::"
+          echo "::group::dist 目录"
+          ls -laR dist 2> /dev/null | head -80 || echo "dist 不存在"
+          echo "::endgroup::"
+          echo "::group::启动日志"
+          cat "$RUNNER_TEMP"/launch-*.log 2> /dev/null | head -120 || true
+          echo "::endgroup::"
