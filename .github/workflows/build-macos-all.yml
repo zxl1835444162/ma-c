@@ -27,6 +27,10 @@ name: 构建 macOS 应用（双架构 + 启动自检）
 #  3) 打包完强制执行「启动自检」：真的把 .app 跑起来 20 秒。
 #     起不来 → 直接判构建失败并在日志里打出完整的启动堆栈。
 #     坏包从此流不出去，你也不用靠猜。
+#     ★ 而且会**分别在浅色和深色两种系统外观下各跑一次**：
+#       本次真实事故就是「Tk 8.6 在深色模式下取色抛 NSException 直接崩」
+#       （崩溃栈 TkpGetColor → NSException，Tk 工单 3e9e82bc）。
+#       修复后把它固化成构建门槛，一旦回归 CI 立刻变红。
 #
 #  4) 上传前扫描包内所有二进制的动态库依赖，出现 /opt/homebrew 或
 #     /usr/local/opt 这类构建机私有绝对路径就报错。
@@ -222,15 +226,18 @@ jobs:
           codesign -dv "$APP" 2>&1 | head -5 || true
 
       # ---------------------------------------------------------------------
-      - name: 启动自检（关键：坏包在这里就被拦下）
+      - name: 启动自检（浅色 + 深色，坏包在这里被拦下）
         run: |
           set -eu
+          # 想临时跳过自检（例如 runner 没有 GUI 会话时）：设 SKIP_SMOKE=1
+          if [ "${SKIP_SMOKE:-0}" = "1" ]; then
+            echo "::warning::SKIP_SMOKE=1，跳过启动自检"
+            exit 0
+          fi
+
           APP="dist/寒山小说发布工具.app"
           BIN="$APP/Contents/MacOS/寒山小说发布工具"
-          LOG="$RUNNER_TEMP/launch-$TARGET_ARCH.log"
-
-          # 干净起点，避免上次运行的 config.ini 干扰
-          rm -rf "$HOME/Library/Application Support/寒山小说发布工具" || true
+          APPDIR="$HOME/Library/Application Support/寒山小说发布工具"
 
           PREFIX=""
           if [ "$TARGET_ARCH" != "$(uname -m)" ]; then
@@ -238,42 +245,75 @@ jobs:
               PREFIX="arch -x86_64"
               echo "runner 是 $(uname -m)，用 Rosetta 跑 $TARGET_ARCH 产物做自检"
             else
-              echo "::warning::runner 无 Rosetta，跳过 $TARGET_ARCH 的启动自检（架构已由 lipo 确认）"
+              echo "::warning::runner 无 Rosetta，跳过启动自检（架构已由 lipo 确认）"
               lipo -archs "$BIN"
               exit 0
             fi
           fi
 
-          echo "启动 $BIN ..."
-          set +e
-          $PREFIX "$BIN" > "$LOG" 2>&1 &
-          PID=$!
-          for _ in $(seq 1 20); do
-            sleep 1
-            kill -0 "$PID" 2> /dev/null || break
-          done
+          smoke() {
+            label="$1"
+            tag="$2"
+            log="$RUNNER_TEMP/launch-$TARGET_ARCH-$tag.log"
+            rm -rf "$APPDIR" || true
 
-          if kill -0 "$PID" 2> /dev/null; then
-            echo "✓ 启动后存活 20 秒，界面进程正常"
-            kill "$PID" 2> /dev/null
-            wait "$PID" 2> /dev/null
-            STATUS=0
-          else
-            wait "$PID" 2> /dev/null
-            STATUS=$?
+            echo "── 启动自检：$label ──"
+            set +e
+            $PREFIX "$BIN" > "$log" 2>&1 &
+            pid=$!
+            for _ in $(seq 1 20); do
+              sleep 1
+              kill -0 "$pid" 2> /dev/null || break
+            done
+
+            if kill -0 "$pid" 2> /dev/null; then
+              echo "  ✓ 存活 20 秒，界面进程正常"
+              kill "$pid" 2> /dev/null
+              wait "$pid" 2> /dev/null
+              set -e
+              head -20 "$log" | sed 's/^/    /' || true
+              return 0
+            fi
+
+            wait "$pid" 2> /dev/null
             set -e
-            echo "::error::打包后的 App 启动即退出（exit=$STATUS）——这个包不能用。"
+            echo "::error::【$label】打包后的 App 启动即退出 —— 这个包不能用。"
             echo "──────────── 启动输出 ────────────"
-            cat "$LOG" || true
+            cat "$log" || true
             echo "──────────────────────────────────"
-            echo "如果是 ModuleNotFoundError: tkinter / _tkinter，说明 Tcl/Tk 没打进包；"
-            echo "如果是 PermissionError: .../playwright/driver/node，说明 rthook 没生效。"
-            exit 1
-          fi
-          set -e
 
-          echo "──────────── 启动输出（前 40 行）────────────"
-          head -40 "$LOG" || true
+            # 已知故障模式，直接点名
+            if grep -q 'TkpGetColor' "$log" 2> /dev/null; then
+              echo "::error::命中 Tk 深色模式崩溃：TkpGetColor → NSException（Tk 工单 3e9e82bc）。"
+              echo "::error::请确认 spec 里 NSRequiresAquaSystemAppearance 为 True，且"
+              echo "::error::rthook_frozen_macos.py 在 Tk 之前就把外观钉成了 Aqua。"
+            elif grep -q 'Terminating app due to uncaught exception' "$log" 2> /dev/null; then
+              grep -m1 'Terminating app due to uncaught exception' "$log" || true
+            elif grep -q '_tkinter\|tkinter' "$log" 2> /dev/null; then
+              echo "::error::疑似 Tcl/Tk 没打进包（tkinter 相关报错）。"
+            elif grep -q 'playwright/driver/node' "$log" 2> /dev/null; then
+              echo "::error::playwright 的 node driver 丢了可执行位，检查 rthook 是否生效。"
+            fi
+            return 1
+          }
+
+          smoke "浅色外观" light
+
+          # ---- 深色模式回归测试 ----
+          # 这正是本次真实崩溃的触发条件。修复后无论系统外观如何都必须能启动，
+          # 所以把它固化成构建门槛：一旦回归，CI 直接红。
+          echo
+          if osascript -e 'tell application "System Events" to tell appearance preferences to set dark mode to true' > /dev/null 2>&1; then
+            echo "已把 runner 切换为深色模式"
+            sleep 3
+            if ! smoke "深色外观（回归测试）" dark; then
+              echo "::error::深色模式下崩溃 —— 外观修复没生效，不能交付。"
+              exit 1
+            fi
+            osascript -e 'tell application "System Events" to tell appearance preferences to set dark mode to false' > /dev/null 2>&1 || true
+          else
+            echo "::warning::无法切换 runner 外观（可能无 GUI 会话），跳过深色模式回归测试"
+          fi
 
       # ---------------------------------------------------------------------
       - name: 公证（配了 Apple 凭据且已正式签名时才执行）
@@ -383,5 +423,8 @@ jobs:
           ls -laR dist 2> /dev/null | head -80 || echo "dist 不存在"
           echo "::endgroup::"
           echo "::group::启动日志"
-          cat "$RUNNER_TEMP"/launch-*.log 2> /dev/null | head -120 || true
+          cat "$RUNNER_TEMP"/launch-*.log 2> /dev/null | head -160 || true
+          echo "::endgroup::"
+          echo "::group::崩溃报告"
+          ls -t "$HOME/Library/Logs/DiagnosticReports"/*.ips 2> /dev/null | head -2 || true
           echo "::endgroup::"

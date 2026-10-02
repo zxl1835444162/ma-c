@@ -177,6 +177,29 @@ if IS_DARWIN:
             'NSDocumentsFolderUsageDescription': '用于读取与保存小说章节文件',
             'NSDownloadsFolderUsageDescription': '用于导出的章节与下载的小说',
             'LSUIElement': False,
-            'NSRequiresAquaSystemAppearance': False,
+            # ------------------------------------------------------------------
+            # 必须是 True（强制浅色外观）。
+            #
+            # Tk 8.6 的 macOS 颜色解析函数 TkpGetColor() 依赖
+            # NSAppearance.currentAppearance。Tk 官方工单 3e9e82bc 明确记录了这里的问题：
+            # TkpGetColor() 并不总是在 TkMacOSXSetupDrawingContext() 区间内被调用，
+            # 于是深色模式下取色会失败并抛出 NSException。
+            #
+            # 后果就是实测到的那次崩溃 —— 创建根窗口时
+            #   TkpGetColor → Tk_GetColor → Tk_Get3DBorder → Tk_InitOptions
+            #   → CreateFrame → Initialize
+            # 抛 NSException，Python 层没人接，直接 SIGABRT。
+            #
+            # 而 False 的语义恰恰相反：它等于「我支持深色模式，请给我深色外观」，
+            # 正好把 Tk 推进了那条会崩的代码路径。PyInstaller 自己也为此打过补丁
+            # （见 pyinstaller#5827，强行把 bootloader 声明的 SDK 版本降到 10.11
+            #   来阻止系统启用深色模式），因为 pyinstaller 的 bootloader 用
+            # macOS 11 SDK 构建，会让冻结程序自动获得深色模式资格。
+            #
+            # 本项目用 python.org universal2 Python 3.10.11（libpython 声明 SDK 11.0），
+            # 不满足 PyInstaller 那个补丁的触发条件（它只处理 SDK 10.9 的 Intel 构建），
+            # 所以必须在这里显式关掉深色模式。
+            # ------------------------------------------------------------------
+            'NSRequiresAquaSystemAppearance': True,
         },
     )

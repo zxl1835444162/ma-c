@@ -42,6 +42,8 @@ hdr "1. 这台 Mac 的环境"
 printf '  macOS 版本 : %s (%s)\n' "$(sw_vers -productVersion)" "$(sw_vers -buildVersion)"
 printf '  CPU 架构   : %s\n' "$(uname -m)"
 printf '  芯片型号   : %s\n' "$(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo 未知)"
+MODE="$(defaults read -g AppleInterfaceStyle 2>/dev/null || echo Light)"
+printf '  外观模式   : %s\n' "$MODE"
 case "$(uname -m)" in
   arm64) echo "  → Apple Silicon。必须用 arm64 或 universal 的安装包。" ;;
   x86_64)
@@ -49,6 +51,10 @@ case "$(uname -m)" in
       echo "  → Intel Mac。必须用 x86_64 或 universal 的安装包（arm64 的包一定打不开）。"
     fi ;;
 esac
+if [ "$MODE" = "Dark" ]; then
+  echo "  ⚠ 你当前是深色模式。Tk 8.6 在深色外观下取色会抛 NSException 直接崩溃，"
+  echo "    这是本次崩溃的头号嫌疑，务必看第 7 节的判定结果。"
+fi
 
 # ---------------------------------------------------------------- 2. App 定位
 hdr "2. 找到的 App"
@@ -128,6 +134,35 @@ echo "  --- Gatekeeper 评估 ---"
 spctl --assess --type execute --verbose=4 "$APP" 2>&1 | sed 's/^/  /'
 echo "  （ad-hoc 签名显示 rejected 是正常的，未公证一律如此）"
 
+# ---------------------------------------------------------------- 6.5 深色模式 / Tk
+hdr "6.5 深色模式与 Tcl/Tk 版本（Tk 崩窗口问题）"
+BID="$(defaults read "$APP/Contents/Info.plist" CFBundleIdentifier 2>/dev/null || echo 未声明)"
+printf '  Bundle ID: %s\n' "$BID"
+FORCED="$(defaults read "$BID" NSRequiresAquaSystemAppearance 2>/dev/null || echo '未设置')"
+printf '  App 是否被强制浅色: %s\n' "$FORCED"
+if [ "$FORCED" = "1" ]; then
+  echo "  ✓ 已强制浅色（这是规避 Tk 深色模式崩溃的正确设置）"
+else
+  echo "  ✗ 未强制浅色。如果系统是深色模式，Tk 8.6 会在创建窗口时崩溃。"
+  echo "    修复命令（复制到终端执行，不影响系统其它外观）："
+  printf '      defaults write %s NSRequiresAquaSystemAppearance -bool YES\n' "$BID"
+  echo "      killall cfprefsd"
+fi
+
+# 看包内是否真的有 Tcl/Tk
+TK_FOUND=""
+for d in "$APP/Contents/Frameworks" "$APP/Contents/Resources" "$APP/Contents/MacOS"; do
+  [ -d "$d" ] || continue
+  f="$(find "$d" -maxdepth 3 -name 'libtk8.6.dylib' 2>/dev/null | head -1)"
+  if [ -n "$f" ]; then TK_FOUND="$f"; break; fi
+done
+if [ -n "$TK_FOUND" ]; then
+  echo "  包内 libtk8.6.dylib ✓（Tcl/Tk 确实打进去了，不是缺库问题）"
+else
+  echo "  ✗ 包内没找到 libtk8.6.dylib（Tcl/Tk 可能真没打进去）"
+fi
+echo "  提示：Tk 8.6.9 及更早对 macOS 深色模式支持很差；8.6.12 也只是部分修好。"
+
 # ---------------------------------------------------------------- 7. 真跑一次
 hdr "7. 直接运行主程序，抓真实报错"
 echo "  下面会直接启动 App 本体并捕获输出（最多等 15 秒）…"
@@ -152,6 +187,31 @@ else
   echo
   sed 's/^/    /' "$LOG"
   echo
+
+  # ---- 关键：把 NSException 的原因单独拎出来 ----
+  REASON="$(grep -m1 -E 'Terminating app due to uncaught exception|NSException' "$LOG" 2>/dev/null)"
+  if [ -n "$REASON" ]; then
+    echo "  ══════════════════════════════════════════════════════"
+    echo "  ★ 关键线索（NSException 原因）："
+    echo "    $REASON"
+    echo "  ══════════════════════════════════════════════════════"
+    echo
+  fi
+
+  if grep -q 'TkpGetColor' "$LOG" 2>/dev/null; then
+    echo "  ★★ 判定：这是 Tk 的 macOS 取色函数崩溃。"
+    echo "     TkpGetColor() 依赖 NSAppearance.currentAppearance，"
+    echo "     在深色外观下会失败并抛 NSException（Tk 工单 3e9e82bc）。"
+    echo "     Python 层接不住这个 Objective-C 异常，直接 SIGABRT。"
+    echo
+    echo "     解法（任选，都不用重新打包）："
+    echo "       ① 上面第 6.5 节那条 defaults write 命令，给这个 App 单独强制浅色"
+    echo "       ② 或：系统设置 → 外观 → 选「浅色」，再打开 App"
+    echo "     根治：Info.plist 里 NSRequiresAquaSystemAppearance 必须为 True，"
+    echo "           同时 rthook 在 Tk 之前把外观钉成 Aqua —— 改完后重新打包。"
+    echo
+  fi
+
   echo "  --- 常见结论对照 ---"
   echo "  ModuleNotFoundError: tkinter / _tkinter"
   echo "      → 打包时 Tcl/Tk 没打进去，是构建问题，需要重新打包（不要用 Homebrew 版 Python 做基座）。"
@@ -170,11 +230,16 @@ if [ -d "$CRASHDIR" ]; then
   ls -t "$CRASHDIR" 2>/dev/null | head -5 | while read -r f; do
     printf '    %s\n' "$f"
   done
-  NEWEST="$(ls -t "$CRASHDIR"/*.ips 2>/dev/null | head -1)"
+  NEWEST="$(ls -t "$CRASHDIR"/寒山小说发布工具*.ips 2>/dev/null | head -1)"
+  [ -n "$NEWEST" ] || NEWEST="$(ls -t "$CRASHDIR"/*.ips 2>/dev/null | head -1)"
   if [ -n "$NEWEST" ]; then
     echo
     printf '  最新一份: %s\n' "$NEWEST"
-    grep -m1 -E '"(exception|termination)"' "$NEWEST" 2>/dev/null | sed 's/^/    /'
+    echo "  --- 异常摘要 ---"
+    grep -oE '"(exception|termination|asi|exceptionReason)"[^}]{0,260}' "$NEWEST" 2>/dev/null \
+      | head -4 | sed 's/^/    /'
+    echo "  --- 崩溃线程最顶部几帧（真正的出错点）---"
+    grep -oE '"[0-9]+ +[^"]{0,140}"' "$NEWEST" 2>/dev/null | head -8 | sed 's/^/    /'
   fi
 else
   echo "    （无）"
@@ -186,6 +251,8 @@ echo "  把上面完整的终端输出复制走即可。重点看："
 echo "    · 第 3 节「架构不匹配」→ 换对应架构的包"
 echo "    · 第 4 节「系统版本不足」→ 换台新一点的 Mac"
 echo "    · 第 5 节「有隔离属性」→ 执行那条 xattr 命令"
+echo "    · 第 6.5 节「未强制浅色」→ 执行那条 defaults write 命令（Tk 崩窗口的头号原因）"
+echo "    · 第 7 节「TkpGetColor」→ 确认是 Tk 深色模式崩溃，该节里有现成的解法"
 echo "    · 第 7 节「启动即退出」→ 是打包问题，贴它的输出"
 echo
 read -n 1 -s -r -p "  按任意键关闭…"

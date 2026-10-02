@@ -106,6 +106,31 @@ if [ -f "$BIN" ] && [ ! -x "$BIN" ]; then
   echo
 fi
 
+# ---------------------------------------------------------------- 强制浅色外观
+# Tk 8.6 在深色模式下取色会抛 NSException 直接崩溃（这是本次实测到的头号原因）。
+# 给这一个 App 单独关掉深色模式，不影响你系统其它地方的外观。
+echo "── 关掉这个 App 的深色模式（规避 Tk 深色模式崩溃）──"
+BID="$(defaults read "$APP/Contents/Info.plist" CFBundleIdentifier 2>/dev/null || true)"
+[ -n "$BID" ] || BID="com.hanshan.novelpublisher"
+echo "  Bundle ID: $BID"
+
+# 设置必须在 App 启动前写入才生效，先把可能残留的进程收掉
+if pgrep -f "$(basename "$BIN")" > /dev/null 2>&1; then
+  echo "  先关闭正在运行的实例…"
+  pkill -f "$(basename "$BIN")" 2>/dev/null || true
+  sleep 2
+fi
+
+CUR="$(defaults read "$BID" NSRequiresAquaSystemAppearance 2>/dev/null || echo '未设置')"
+if [ "$CUR" = "1" ]; then
+  echo "  ✓ 已经是强制浅色，无需改动"
+else
+  defaults write "$BID" NSRequiresAquaSystemAppearance -bool YES
+  echo "  ✓ 已设置为强制浅色（原来是：$CUR）"
+  killall cfprefsd 2>/dev/null || true
+fi
+echo
+
 # ---------------------------------------------------------------- 打开
 echo "── 打开应用 ──"
 open "$APP" || {
